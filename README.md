@@ -1,710 +1,340 @@
-# Terragrunt - Terraform Wrapper for DRY, Maintainable Infrastructure
+# Terragrunt: Recommended Usage Guide
 
-> **Version**: Compatible with Terraform >= 1.0 and Terragrunt >= 0.50  
-> **Last Updated**: 2026-11-09
+## 1. Do you even need Terragrunt?
 
----
+Your understanding is mostly right. Terragrunt is a thin wrapper around Terraform/OpenTofu. It does not replace it.
 
-## 📋 Table of Contents
+| Situation | Recommendation |
+|---|---|
+| One root module + `dev/qa/prod.tfvars`, state managed by **Terraform Cloud** (state + locking built in) | **Plain Terraform is enough.** No Terragrunt. |
+| One root module + tfvars, state in **S3** | Plain Terraform works, but you must pass a different backend key per env (`-backend-config`) or use workspaces. This is where Terragrunt starts to help. |
+| **Many modules** (vpc, eks, rds, iam ...) x **many envs** (dev, qa, prod) | **Use Terragrunt.** It removes duplicated backend/provider blocks and wires module dependencies. |
 
-1. [What is Terragrunt?](#what-is-terragrunt)
-2. [Why Terragrunt?](#why-terragrunt)
-3. [Installation](#installation)
-4. [Project Structure Best Practices](#project-structure-best-practices)
-5. [Configuration Files Explained](#configuration-files-explained)
-6. [Handling tfvars Files](#handling-tfvars-files)
-7. [Complete Working Example](#complete-working-example)
-8. [Advanced Patterns](#advanced-patterns)
-9. [Common Commands](#common-commands)
-10. [Best Practices Checklist](#best-practices-checklist)
-11. [Troubleshooting](#troubleshooting)
+What Terragrunt actually gives you:
 
----
+- **DRY backend config**: one `remote_state` block generates the S3 backend for every module and env, with an automatic unique state key per folder.
+- **DRY provider config**: one `generate "provider"` block instead of a `provider.tf` copied everywhere.
+- **Auto-creates** the S3 bucket (and lock table, if used) on first run.
+- **Dependencies** between modules (`dependency` blocks, e.g. EKS reads VPC outputs) and `run --all` to apply them in order.
+- **Small state files**: one state per module per env, so blast radius is small.
 
-## What is Terragrunt?
-
-**Terragrunt** is a thin wrapper around [Terraform](https://www.terraform.io/) that provides:
-
-| Feature | Description |
-|---------|-------------|
-| **DRY Configuration** | Define common settings once, inherit everywhere |
-| **Remote State Management** | Automatic S3/GCS/Azure backend configuration |
-| **Locking** | Built-in DynamoDB/GCP locking for state files |
-| **Dependency Management** | Track dependencies between Terraform modules |
-| **Multiple Environments** | Same code, different configs (dev/staging/prod) |
-| **Hooks & Error Handling** | Pre/post execution hooks |
-| **Generate Files** | Auto-generate provider configs, backend configs |
+> Note: Terraform 1.10+ supports **native S3 locking** (`use_lockfile = true`), so DynamoDB is no longer required for new setups. Use DynamoDB only if you are on an older Terraform version.
 
 ---
 
-## Why Terragrunt?
-
-### Problem Without Terragrunt
+## 2. Your current structure (works, but state is the weak point)
 
 ```
-❌ Duplicated backend config in every module
-❌ Copy-pasted provider settings
-❌ Manual state file management
-❌ No easy way to share variables across environments
+project/
+├── main.tf
+├── provider.tf
+├── variables.tf
+├── outputs.tf
+├── locals.tf
+├── data.tf
+└── Env/
+    ├── dev.tfvars
+    ├── qa.tfvars
+    └── prod.tfvars
 ```
 
-### Solution With Terragrunt
+Plain Terraform usage:
 
-```
-✅ Single source of truth for backend/providers
-✅ Hierarchical variable inheritance
-✅ Automatic state isolation per environment
-✅ Explicit dependency graph
-```
-
----
-
-## Installation
-
-### macOS
 ```bash
-brew install terragrunt
+terraform init -backend-config="key=dev/terraform.tfstate"
+terraform plan  -var-file=Env/dev.tfvars
+terraform apply -var-file=Env/dev.tfvars
 ```
 
-### Linux
-```bash
-# Download latest release
-wget https://github.com/gruntwork-io/terragrunt/releases/latest/download/terragrunt_linux_amd64
-chmod +x terragrunt_linux_amd64
-sudo mv terragrunt_linux_amd64 /usr/local/bin/terragrunt
-```
-
-### Windows
-```powershell
-# Using Chocolatey
-choco install terragrunt
-
-# Or download binary from GitHub releases
-```
-
-### Verify Installation
-```bash
-terragrunt --version
-# terragrunt version v0.67.0
-```
+Risk: if you forget to change the backend key (or run `init -reconfigure`), you can plan/apply dev values against prod state. Terragrunt removes that risk because the state key comes from the folder path.
 
 ---
 
-## Project Structure Best Practices
+## 3. Recommended Terragrunt structure
 
-### Recommended Directory Layout
-
-```
-infrastructure/
-├── terragrunt.hcl                 # Root configuration (shared)
-├── common.hcl                     # Common variables
-├── account.hcl                    # Account-level settings
-├── environments/
-│   ├── dev/
-│   │   ├── env.hcl               # Environment-specific settings
-│   │   ├── vpc/
-│   │   │   └── terragrunt.hcl    # Module configuration
-│   │   ├── eks/
-│   │   │   └── terragrunt.hcl
-│   │   └── rds/
-│   │       └── terragrunt.hcl
-│   ├── staging/
-│   │   ├── env.hcl
-│   │   └── ...
-│   └── prod/
-│       ├── env.hcl
-│       └── ...
-└── modules/                       # Reusable Terraform modules
-    ├── vpc/
-    ├── eks/
-    └── rds/
-```
-
-### Alternative: Flat Structure (Small Projects)
+Separate **what to deploy** (modules) from **where/how to deploy it** (live config).
 
 ```
-infrastructure/
-├── terragrunt.hcl
-├── dev.tfvars
-├── staging.tfvars
-├── prod.tfvars
-└── modules/
-```
-
----
-
-## Configuration Files Explained
-
-| File | Purpose | Scope |
-|------|---------|-------|
-| `terragrunt.hcl` | Main Terragrunt config | Per-module or root |
-| `terragrunt.hcl.json` | JSON alternative | Per-module |
-| `common.hcl` | Shared variables | Root level |
-| `env.hcl` | Environment variables | Per-environment |
-| `account.hcl` | Account/region settings | Root level |
-| `*.tfvars` | Terraform variables | Passed to Terraform |
-| `*.tfvars.json` | JSON format variables | Passed to Terraform |
-
----
-
-## Handling tfvars Files
-
-### The Problem: Multiple Variable Sources
-
-When you have:
-- `common.tfvars` (shared variables)
-- `dev.tfvars` (environment-specific)
-- `secrets.tfvars` (sensitive data)
-- `terragrunt.hcl` (Terragrunt config)
-
-**How does Terragrunt merge them?**
-
-### Solution: Hierarchical Variable Loading
-
-Terragrunt uses **layered configuration** with `read_terragrunt_config()`:
-
-```hcl
-# terragrunt.hcl (root)
-locals {
-  # Load common variables
-  common = read_terragrunt_config("${get_parent_terragrunt_dir()}/common.hcl")
-
-  # Load environment variables
-  env = read_terragrunt_config("${get_parent_terragrunt_dir()}/${path_relative_to_include()}/env.hcl")
-
-  # Merge all variables (later overrides earlier)
-  merged_vars = merge(
-    local.common.locals,
-    local.env.locals
-  )
-}
-
-# Pass to Terraform as tfvars
-terraform {
-  extra_arguments "common_vars" {
-    commands = get_terraform_commands_that_need_vars()
-
-    arguments = [
-      "-var-file=${get_parent_terragrunt_dir()}/common.tfvars",
-      "-var-file=${get_terragrunt_dir()}/${local.env.locals.environment}.tfvars"
-    ]
-  }
-}
-```
-
-### Method 1: Using `extra_arguments` (Recommended)
-
-```hcl
-# terragrunt.hcl
-terraform {
-  # ... other config ...
-
-  extra_arguments "variables" {
-    commands = [
-      "apply",
-      "plan",
-      "import",
-      "push",
-      "refresh",
-      "destroy"
-    ]
-
-    arguments = [
-      "-var-file=${get_parent_terragrunt_dir()}/common.tfvars",
-      "-var-file=${get_terragrunt_dir()}/environment.tfvars",
-      "-var-file=${get_terragrunt_dir()}/secrets.tfvars"  # Optional
-    ]
-  }
-}
-```
-
-### Method 2: Using `tfvars` Files with `include`
-
-```hcl
-# Root terragrunt.hcl
-locals {
-  environment = "dev"
-}
-
-terraform {
-  extra_arguments "vars" {
-    commands = get_terraform_commands_that_need_vars()
-    arguments = [
-      "-var-file=${get_parent_terragrunt_dir()}/${local.environment}.tfvars"
-    ]
-  }
-}
-```
-
-### Method 3: Programmatic Variable Generation
-
-```hcl
-# terragrunt.hcl
-generate "tfvars" {
-  path      = "terragrunt.auto.tfvars"
-  if_exists = "overwrite"
-  contents  = <<EOF
-environment = "${local.env.locals.environment}"
-region      = "${local.env.locals.region}"
-project     = "${local.common.locals.project_name}"
-
-# Computed values
-tags = {
-  Environment = "${local.env.locals.environment}"
-  Project     = "${local.common.locals.project_name}"
-  ManagedBy   = "terragrunt"
-}
-EOF
-}
-```
-
----
-
-## Complete Working Example
-
-### File Structure
-
-```
-infrastructure/
-├── terragrunt.hcl              # Root config
-├── common.hcl                  # Shared variables
-├── common.tfvars               # Shared tfvars
-├── dev.tfvars                  # Dev environment
-├── prod.tfvars                 # Prod environment
-└── environments/
+infra/
+├── modules/                       # Your existing Terraform code, unchanged
+│   └── app/
+│       ├── main.tf
+│       ├── variables.tf
+│       ├── outputs.tf
+│       ├── locals.tf
+│       └── data.tf                # (no provider.tf / backend here; Terragrunt generates it)
+│
+└── live/
+    ├── root.hcl                   # Single reference file: backend + provider + common inputs
     ├── dev/
-    │   └── vpc/
+    │   ├── env.hcl                # env-level values (name, region, account)
+    │   └── app/
+    │       └── terragrunt.hcl     # points to modules/app + dev inputs
+    ├── qa/
+    │   ├── env.hcl
+    │   └── app/
     │       └── terragrunt.hcl
     └── prod/
-        └── vpc/
+        ├── env.hcl
+        └── app/
             └── terragrunt.hcl
 ```
 
-### 1. Root `terragrunt.hcl`
+When you add more modules (vpc, eks, rds), add a sibling folder under each env:
+
+```
+live/dev/
+├── env.hcl
+├── vpc/terragrunt.hcl
+├── eks/terragrunt.hcl
+└── rds/terragrunt.hcl
+```
+
+Key idea: **every env folder calls the same `root.hcl`**, so backend and provider code is written once.
+
+---
+
+## 4. Files
+
+### 4.1 `live/root.hcl` (the single reference file)
 
 ```hcl
-# infrastructure/terragrunt.hcl
+locals {
+  # Read env.hcl from the closest parent folder (dev/qa/prod)
+  env_vars = read_terragrunt_config(find_in_parent_folders("env.hcl"))
 
-# Configure Terragrunt to automatically store tfstate files in S3
+  env        = local.env_vars.locals.env
+  aws_region = local.env_vars.locals.aws_region
+  account_id = local.env_vars.locals.account_id
+}
+
+# Remote state in S3. The key is built from the folder path, so it is unique per module per env.
 remote_state {
   backend = "s3"
+
   generate = {
     path      = "backend.tf"
-    if_exists = "overwrite"
+    if_exists = "overwrite_terragrunt"
   }
+
   config = {
-    bucket         = "my-terraform-state-${get_aws_account_id()}"
-    key            = "${path_relative_to_include()}/terraform.tfstate"
-    region         = "us-east-1"
-    encrypt        = true
-    dynamodb_table = "terraform-locks"
+    bucket       = "my-company-tfstate-${local.account_id}-${local.aws_region}"
+    key          = "${path_relative_to_include()}/terraform.tfstate"
+    region       = local.aws_region
+    encrypt      = true
+    use_lockfile = true            # native S3 locking (Terraform >= 1.10)
+
+    # If you are on Terraform < 1.10, use DynamoDB locking instead:
+    # dynamodb_table = "my-company-tf-locks"
   }
 }
 
-# Generate provider configuration
+# Generate provider.tf for every module, so you never copy it again.
 generate "provider" {
   path      = "provider.tf"
-  if_exists = "overwrite"
+  if_exists = "overwrite_terragrunt"
   contents  = <<EOF
 provider "aws" {
-  region = var.region
+  region = "${local.aws_region}"
 
   default_tags {
     tags = {
+      Environment = "${local.env}"
       ManagedBy   = "terragrunt"
-      Project     = var.project_name
-      Environment = var.environment
     }
   }
 }
 EOF
 }
 
-# Load common configuration
-locals {
-  common = read_terragrunt_config("${get_parent_terragrunt_dir()}/common.hcl")
-}
-
-# Pass variables to Terraform
-terraform {
-  # Include common tfvars
-  extra_arguments "common_vars" {
-    commands = get_terraform_commands_that_need_vars()
-    arguments = [
-      "-var-file=${get_parent_terragrunt_dir()}/common.tfvars"
-    ]
-  }
-}
-
-# Inputs that all environments inherit
+# Inputs available to every module in every env
 inputs = {
-  project_name = local.common.locals.project_name
-  owner        = local.common.locals.owner
+  environment = local.env
+  region      = local.aws_region
 }
 ```
 
-### 2. `common.hcl` (Shared Variables)
+### 4.2 `live/dev/env.hcl`
 
 ```hcl
-# infrastructure/common.hcl
 locals {
-  project_name = "my-awesome-project"
-  owner        = "platform-team"
-
-  common_tags = {
-    Project   = "my-awesome-project"
-    Owner     = "platform-team"
-    ManagedBy = "terragrunt"
-  }
+  env        = "dev"
+  aws_region = "ap-south-1"
+  account_id = "111111111111"
 }
 ```
 
-### 3. `common.tfvars` (Shared tfvars)
+Repeat for `qa` and `prod` with their own values.
+
+### 4.3 `live/dev/app/terragrunt.hcl`
 
 ```hcl
-# infrastructure/common.tfvars
-project_name = "my-awesome-project"
-owner        = "platform-team"
-
-common_tags = {
-  Project   = "my-awesome-project"
-  Owner     = "platform-team"
-  ManagedBy = "terragrunt"
-}
-```
-
-### 4. Environment tfvars Files
-
-```hcl
-# infrastructure/dev.tfvars
-environment = "dev"
-region      = "us-east-1"
-
-vpc_cidr = "10.0.0.0/16"
-availability_zones = ["us-east-1a", "us-east-1b"]
-
-instance_type = "t3.micro"
-min_size      = 1
-max_size      = 3
-
-db_instance_class = "db.t3.micro"
-db_allocated_storage = 20
-```
-
-```hcl
-# infrastructure/prod.tfvars
-environment = "prod"
-region      = "us-east-1"
-
-vpc_cidr = "10.1.0.0/16"
-availability_zones = ["us-east-1a", "us-east-1b", "us-east-1c"]
-
-instance_type = "t3.large"
-min_size      = 3
-max_size      = 10
-
-db_instance_class = "db.r5.large"
-db_allocated_storage = 100
-
-enable_deletion_protection = true
-enable_multi_az = true
-```
-
-### 5. Module-Level `terragrunt.hcl`
-
-```hcl
-# infrastructure/environments/dev/vpc/terragrunt.hcl
-
-# Include root configuration
 include "root" {
-  path   = find_in_parent_folders()
-  expose = true  # Make root inputs available
+  path = find_in_parent_folders("root.hcl")
 }
 
-# Load environment-specific config
-locals {
-  env = read_terragrunt_config("${get_parent_terragrunt_dir()}/../../dev.tfvars")
-}
-
-# Terraform source
 terraform {
-  source = "../../../modules//vpc"
-
-  # Add environment-specific tfvars
-  extra_arguments "env_vars" {
-    commands = get_terraform_commands_that_need_vars()
-    arguments = [
-      "-var-file=${get_parent_terragrunt_dir()}/../../dev.tfvars"
-    ]
-  }
+  source = "../../../modules/app"
 }
 
-# Environment-specific inputs
+# Values that replace your old dev.tfvars
 inputs = {
-  environment        = "dev"
-  vpc_cidr           = "10.0.0.0/16"
-  availability_zones = ["us-east-1a", "us-east-1b"]
-
-  tags = merge(
-    include.root.inputs.common_tags,
-    {
-      Environment = "dev"
-      Module      = "vpc"
-    }
-  )
+  instance_type = "t3.small"
+  min_size      = 1
+  max_size      = 2
 }
 ```
 
-### 6. Running Commands
+`qa/app/terragrunt.hcl` and `prod/app/terragrunt.hcl` are identical except for `inputs` (and prod can pin a module version, see below).
+
+### 4.4 Module `variables.tf` must declare the inputs
+
+```hcl
+variable "environment"   { type = string }
+variable "region"        { type = string }
+variable "instance_type" { type = string }
+variable "min_size"      { type = number }
+variable "max_size"      { type = number }
+```
+
+Remove `provider.tf` and any `terraform { backend ... }` block from the module, because Terragrunt generates them.
+
+---
+
+## 5. Migrating from your current structure
+
+1. Create `infra/modules/app/` and move `main.tf`, `variables.tf`, `outputs.tf`, `locals.tf`, `data.tf` into it.
+2. Delete `provider.tf` (now generated by `root.hcl`).
+3. Convert each `Env/*.tfvars` into the `inputs = { ... }` block of the matching `live/<env>/app/terragrunt.hcl`.
+4. Create `root.hcl` and `env.hcl` files as shown above.
+5. **If you already have state**, migrate it. Do not just run apply, or Terraform will try to recreate everything:
+   ```bash
+   cd live/dev/app
+   terragrunt init -migrate-state
+   terragrunt plan        # should show NO changes
+   ```
+6. Repeat for qa and prod. Always confirm that `plan` is clean before moving on.
+
+---
+
+## 6. Daily commands
+
+Run from inside the module folder:
 
 ```bash
-# Plan dev environment
-cd infrastructure/environments/dev/vpc
+cd live/dev/app
+
+terragrunt init
 terragrunt plan
+terragrunt apply
+terragrunt destroy
+```
 
-# Apply with explicit var file
-terragrunt apply -var-file=../../../dev.tfvars
+Run for a whole environment (all modules, dependency order respected):
 
-# Plan all environments
-terragrunt run-all plan
+```bash
+cd live/dev
 
-# Apply with confirmation
-terragrunt run-all apply
+terragrunt run --all plan        # Terragrunt >= 0.73
+terragrunt run --all apply
+
+# Older Terragrunt versions:
+# terragrunt run-all plan
+# terragrunt run-all apply
+```
+
+Useful extras:
+
+```bash
+terragrunt plan -out=tfplan                  # save a plan
+terragrunt hcl format                        # format .hcl files (older: hclfmt)
+terragrunt output                            # module outputs
+terragrunt run --all plan --non-interactive  # CI usage
 ```
 
 ---
 
-## Advanced Patterns
+## 7. Dependencies between modules
 
-### Pattern 1: Multiple tfvars with Precedence
-
-```hcl
-# terragrunt.hcl
-terraform {
-  extra_arguments "vars" {
-    commands = get_terraform_commands_that_need_vars()
-    arguments = [
-      # Order matters: later files override earlier ones
-      "-var-file=${get_parent_terragrunt_dir()}/common.tfvars",
-      "-var-file=${get_parent_terragrunt_dir()}/region.tfvars",
-      "-var-file=${get_parent_terragrunt_dir()}/env.tfvars",
-      "-var-file=${get_terragrunt_dir()}/override.tfvars"  # Module-specific
-    ]
-  }
-}
-```
-
-### Pattern 2: Conditional tfvars Loading
+Example: EKS needs VPC outputs.
 
 ```hcl
-locals {
-  env = get_env("ENV", "dev")
-
-  # Only include secrets file if it exists
-  secrets_file = fileexists("${get_terragrunt_dir()}/secrets.tfvars") ?     "-var-file=${get_terragrunt_dir()}/secrets.tfvars" : ""
+# live/dev/eks/terragrunt.hcl
+include "root" {
+  path = find_in_parent_folders("root.hcl")
 }
 
 terraform {
-  extra_arguments "vars" {
-    commands = get_terraform_commands_that_need_vars()
-    arguments = compact([
-      "-var-file=${get_parent_terragrunt_dir()}/common.tfvars",
-      "-var-file=${get_parent_terragrunt_dir()}/${local.env}.tfvars",
-      local.secrets_file
-    ])
-  }
+  source = "../../../modules/eks"
 }
-```
-
-### Pattern 3: Using `inputs` Instead of tfvars
-
-```hcl
-# terragrunt.hcl
-locals {
-  common = read_terragrunt_config("${get_parent_terragrunt_dir()}/common.hcl")
-  env      = read_terragrunt_config("${get_parent_terragrunt_dir()}/env.hcl")
-}
-
-# Direct variable assignment (no tfvars needed)
-inputs = {
-  # From common.hcl
-  project_name = local.common.locals.project_name
-  owner        = local.common.locals.owner
-
-  # From env.hcl
-  environment = local.env.locals.environment
-  region      = local.env.locals.region
-
-  # Computed values
-  name_prefix = "${local.common.locals.project_name}-${local.env.locals.environment}"
-
-  tags = merge(
-    local.common.locals.common_tags,
-    {
-      Environment = local.env.locals.environment
-    }
-  )
-}
-```
-
-### Pattern 4: Dependency Management
-
-```hcl
-# infrastructure/environments/dev/eks/terragrunt.hcl
 
 dependency "vpc" {
   config_path = "../vpc"
 
-  # Mock outputs for plan phase
+  # Lets `plan` work before the VPC exists
   mock_outputs = {
-    vpc_id          = "vpc-12345678"
-    private_subnets = ["subnet-123", "subnet-456"]
+    vpc_id          = "vpc-00000000"
+    private_subnets = ["subnet-00000000"]
   }
-  mock_outputs_allowed_terraform_commands = ["validate", "plan"]
+  mock_outputs_allowed_terraform_commands = ["init", "validate", "plan"]
 }
 
 inputs = {
-  vpc_id          = dependency.vpc.outputs.vpc_id
-  private_subnets = dependency.vpc.outputs.private_subnets
+  vpc_id     = dependency.vpc.outputs.vpc_id
+  subnet_ids = dependency.vpc.outputs.private_subnets
 }
 ```
 
-### Pattern 5: Hooks for Secrets Management
+`terragrunt run --all apply` will apply `vpc` first, then `eks`.
 
-```hcl
-terraform {
-  # Fetch secrets before running Terraform
-  before_hook "decrypt_secrets" {
-    commands = ["apply", "plan"]
-    execute  = ["sops", "-d", "--in-place", "secrets.enc.yaml"]
+---
+
+## 8. Best practices checklist
+
+- **Pin versions.** Add a `versions.tf` (or generate one) with `required_version` and provider versions. Commit `.terraform.lock.hcl`.
+- **One state per module per env.** Never put everything in one state.
+- **Use `root.hcl`, not a root `terragrunt.hcl`.** Newer Terragrunt versions recommend this to avoid confusion with child files.
+- **Version your modules.** Keep modules in a separate repo and reference a tag, so prod only changes when you bump the tag:
+  ```hcl
+  terraform {
+    source = "git::git@github.com:my-org/terraform-modules.git//app?ref=v1.4.0"
   }
+  ```
+  Promote the same tag dev -> qa -> prod.
+- **Separate AWS accounts per env** (or at least separate state buckets). Set the account via `env.hcl`.
+- **Encrypt and protect the state bucket**: versioning on, encryption on, public access blocked, restricted IAM.
+- **Never commit secrets.** Use AWS Secrets Manager / SSM Parameter Store, or `sops`, not plain values in `inputs`.
+- **Use `mock_outputs`** for dependencies so `plan` and `validate` work in CI.
+- **Always `plan` before `apply`** in CI, with manual approval for prod.
+- **Keep `.terragrunt-cache/` and `.terraform/` in `.gitignore`.**
 
-  # Clean up after
-  after_hook "encrypt_secrets" {
-    commands = ["apply", "plan"]
-    execute  = ["sops", "-e", "--in-place", "secrets.enc.yaml"]
-    run_on_error = true
-  }
-}
+`.gitignore`:
+
+```
+.terragrunt-cache/
+.terraform/
+*.tfstate
+*.tfstate.backup
+tfplan
 ```
 
 ---
 
-## Common Commands
+## 9. Terragrunt vs Terraform Cloud
 
-| Command | Description |
-|---------|-------------|
-| `terragrunt plan` | Show execution plan |
-| `terragrunt apply` | Apply changes |
-| `terragrunt destroy` | Destroy infrastructure |
-| `terragrunt output` | Show outputs |
-| `terragrunt validate` | Validate configuration |
-| `terragrunt run-all plan` | Plan all modules in tree |
-| `terragrunt run-all apply` | Apply all modules |
-| `terragrunt hclfmt` | Format all .hcl files |
-| `terragrunt validate-inputs` | Check inputs match variables |
-| `terragrunt graph-dependencies` | Show dependency graph |
-| `terragrunt render-json` | Output JSON representation |
+| | Terragrunt (+ S3) | Terraform Cloud |
+|---|---|---|
+| State storage and locking | S3 (+ native lock or DynamoDB), you manage it | Built in |
+| Per-env config | Folder + `inputs` | Workspaces + variables / tfvars |
+| DRY backend/provider | Yes, via `root.hcl` | Not needed (managed) |
+| Module dependency ordering | `dependency` blocks, `run --all` | Run triggers between workspaces |
+| Cost | Free (open source) | Free tier, then paid |
 
-### Useful Flags
-
-```bash
-# Non-interactive mode
-terragrunt apply --terragrunt-non-interactive
-
-# Working directory
-terragrunt apply --terragrunt-working-dir=environments/dev/vpc
-
-# Config file
-terragrunt apply --terragrunt-config=custom.hcl
-
-# Debug logging
-terragrunt apply --terragrunt-log-level debug
-```
+Pick **one** model for state and locking. Do not combine Terraform Cloud's backend with Terragrunt's `remote_state` for the same module.
 
 ---
 
-## Best Practices Checklist
+## 10. Quick decision summary
 
-### ✅ Configuration
-- [ ] Use `include` to inherit from parent `terragrunt.hcl`
-- [ ] Keep environment-specific values in `env.hcl` or `*.tfvars`
-- [ ] Use `locals` for computed values
-- [ ] Prefer `inputs` over `extra_arguments` when possible
-- [ ] Use `generate` blocks for provider/backend configs
-
-### ✅ State Management
-- [ ] Always use remote state (S3/GCS/Azure)
-- [ ] Enable state locking (DynamoDB/Cloud Storage)
-- [ ] Use unique state keys per module: `${path_relative_to_include()}`
-- [ ] Enable versioning on state buckets
-
-### ✅ Security
-- [ ] Never commit secrets to version control
-- [ ] Use SOPS, Vault, or AWS Secrets Manager
-- [ ] Encrypt state files at rest
-- [ ] Use IAM roles with least privilege
-
-### ✅ Code Quality
-- [ ] Run `terragrunt hclfmt` before committing
-- [ ] Use `terragrunt validate-inputs` to catch typos
-- [ ] Document module inputs/outputs
-- [ ] Use consistent naming conventions
-
-### ✅ Team Workflow
-- [ ] Use `dependency` blocks with `mock_outputs`
-- [ ] Run `terragrunt run-all validate` in CI
-- [ ] Use `terragrunt graph-dependencies` to visualize
-- [ ] Pin Terraform and provider versions
-
----
-
-## Troubleshooting
-
-### Issue: "Variables not found"
-
-**Solution**: Check variable precedence and file paths
-```bash
-# Debug variable loading
-terragrunt plan --terragrunt-log-level debug 2>&1 | grep -i var-file
-```
-
-### Issue: "State file locked"
-
-**Solution**: Force unlock (use carefully)
-```bash
-terragrunt force-unlock <LOCK_ID>
-```
-
-### Issue: "Cycle in dependency graph"
-
-**Solution**: Review `dependency` blocks for circular references
-```bash
-terragrunt graph-dependencies | dot -Tsvg > graph.svg
-```
-
-### Issue: "Backend configuration changed"
-
-**Solution**: Reinitialize
-```bash
-terragrunt init -reconfigure
-```
-
----
-
-## Resources
-
-- [Official Documentation](https://terragrunt.gruntwork.io/)
-- [GitHub Repository](https://github.com/gruntwork-io/terragrunt)
-- [Best Practices Guide](https://terragrunt.gruntwork.io/docs/features/best-practices/)
-- [Community Slack](https://gruntwork-community.slack.com/)
-
----
-
-## License
-
-This README is provided as a reference implementation. Adapt to your organization's needs.
-
----
-
-**Happy Infrastructure Managing! 🚀**
+- Single root module + tfvars + Terraform Cloud -> **plain Terraform**, no Terragrunt.
+- Multiple modules and multiple envs with S3 state -> **Terragrunt**, with one `root.hcl`, one `env.hcl` per env, and a thin `terragrunt.hcl` per module per env.
